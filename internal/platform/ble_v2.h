@@ -15,7 +15,10 @@
 #ifndef PLATFORM_PUBLIC_BLE_V2_H_
 #define PLATFORM_PUBLIC_BLE_V2_H_
 
+#include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "internal/platform/bluetooth_adapter.h"
