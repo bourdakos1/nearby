@@ -15,7 +15,10 @@
 #ifndef PLATFORM_PUBLIC_BLE_V2_H_
 #define PLATFORM_PUBLIC_BLE_V2_H_
 
+#include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "internal/platform/bluetooth_adapter.h"
@@ -30,32 +33,10 @@
 namespace location {
 namespace nearby {
 
-// Opaque wrapper over a ServerGattConnection.
-class ServerGattConnection final {
- public:
-  ServerGattConnection() = default;
-  explicit ServerGattConnection(
-      api::ble_v2::ServerGattConnection* server_gatt_connection)
-      : impl_(server_gatt_connection) {}
-
-  bool SendCharacteristic(const api::ble_v2::GattCharacteristic& characteristic,
-                          const ByteArray& value) {
-    return impl_->SendCharacteristic(characteristic, value);
-  }
-
-  api::ble_v2::ServerGattConnection* GetImpl() { return impl_; }
-
-  bool IsValid() const { return impl_ != nullptr; }
-
- private:
-  api::ble_v2::ServerGattConnection* impl_ = nullptr;
-};
-
 // Opaque wrapper over a GattServer.
 // Move only, disallow copy.
 class GattServer final {
  public:
-  GattServer() = default;
   explicit GattServer(std::unique_ptr<api::ble_v2::GattServer> gatt_server)
       : impl_(std::move(gatt_server)) {}
   GattServer(GattServer&&) = default;
@@ -92,6 +73,42 @@ class GattServer final {
   std::unique_ptr<api::ble_v2::GattServer> impl_;
 };
 
+class GattClient final {
+ public:
+  explicit GattClient(
+      std::unique_ptr<api::ble_v2::GattClient> client_gatt_connection)
+      : impl_(std::move(client_gatt_connection)) {}
+  GattClient(const GattClient&) = default;
+  GattClient& operator=(const GattClient&) = default;
+
+  bool DiscoverService(const std::string& service_uuid) {
+    return impl_->DiscoverService(service_uuid);
+  }
+
+  absl::optional<api::ble_v2::GattCharacteristic> GetCharacteristic(
+      const std::string& service_uuid, const std::string& characteristic_uuid) {
+    return impl_->GetCharacteristic(service_uuid, characteristic_uuid);
+  }
+
+  absl::optional<ByteArray> ReadCharacteristic(
+      api::ble_v2::GattCharacteristic& characteristic) {
+    return impl_->ReadCharacteristic(characteristic);
+  }
+
+  void Disconnect() { impl_->Disconnect(); }
+
+  // Returns true if a client_gatt_connection is usable. If this method returns
+  // false, it is not safe to call any other method.
+  bool IsValid() const { return impl_ != nullptr; }
+
+  // Returns reference to platform implementation.
+  // This is used to communicate with platform code, and for debugging purposes.
+  api::ble_v2::GattClient* GetImpl() { return impl_.get(); }
+
+ private:
+  std::unique_ptr<api::ble_v2::GattClient> impl_;
+};
+
 // Container of operations that can be performed over the BLE medium.
 class BleV2Medium final {
  public:
@@ -111,17 +128,6 @@ class BleV2Medium final {
             BleV2Peripheral, const api::ble_v2::BleAdvertisementData&>();
   };
 
-  struct ServerGattConnectionCallback {
-    std::function<void(ServerGattConnection& connection,
-                       const api::ble_v2::GattCharacteristic& characteristic)>
-        characteristic_subscription_cb = location::nearby::DefaultCallback<
-            ServerGattConnection&, const api::ble_v2::GattCharacteristic&>();
-    std::function<void(ServerGattConnection& connection,
-                       const api::ble_v2::GattCharacteristic& characteristic)>
-        characteristic_unsubscription_cb = location::nearby::DefaultCallback<
-            ServerGattConnection&, const api::ble_v2::GattCharacteristic&>();
-  };
-
   explicit BleV2Medium(BluetoothAdapter& adapter)
       : impl_(
             api::ImplementationPlatform::CreateBleV2Medium(adapter.GetImpl())),
@@ -139,8 +145,12 @@ class BleV2Medium final {
                      api::ble_v2::PowerMode power_mode, ScanCallback callback);
   bool StopScanning();
 
-  std::unique_ptr<GattServer> StartGattServer(
-      ServerGattConnectionCallback callback);
+  // Starts Gatt Server for waiting to client connection.
+  std::unique_ptr<GattServer> StartGattServer();
+
+  // Returns a new GattClient connection to a gatt server.
+  std::unique_ptr<GattClient> ConnectToGattServer(
+      BleV2Peripheral peripheral, api::ble_v2::PowerMode power_mode);
 
   bool IsValid() const { return impl_ != nullptr; }
 
@@ -150,8 +160,6 @@ class BleV2Medium final {
   Mutex mutex_;
   std::unique_ptr<api::ble_v2::BleMedium> impl_;
   BluetoothAdapter& adapter_;
-  ServerGattConnectionCallback server_gatt_connection_callback_
-      ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_set<api::ble_v2::BlePeripheral*> peripherals_
       ABSL_GUARDED_BY(mutex_);
   ScanCallback scan_callback_ ABSL_GUARDED_BY(mutex_);

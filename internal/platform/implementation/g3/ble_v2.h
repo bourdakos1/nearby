@@ -54,19 +54,16 @@ class BleV2Medium : public api::ble_v2::BleMedium {
                      ScanCallback callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
   bool StopScanning() override ABSL_LOCKS_EXCLUDED(mutex_);
-  std::unique_ptr<api::ble_v2::GattServer> StartGattServer(
-      api::ble_v2::ServerGattConnectionCallback callback) override
+  std::unique_ptr<api::ble_v2::GattServer> StartGattServer() override
       ABSL_LOCKS_EXCLUDED(mutex_);
   bool StartListeningForIncomingBleSockets(
       const api::ble_v2::ServerBleSocketLifeCycleCallback& callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
   void StopListeningForIncomingBleSockets() override
       ABSL_LOCKS_EXCLUDED(mutex_);
-  std::unique_ptr<api::ble_v2::ClientGattConnection> ConnectToGattServer(
-      api::ble_v2::BlePeripheral& peripheral, Mtu mtu,
-      api::ble_v2::PowerMode power_mode,
-      api::ble_v2::ClientGattConnectionCallback callback) override
-      ABSL_LOCKS_EXCLUDED(mutex_);
+  std::unique_ptr<api::ble_v2::GattClient> ConnectToGattServer(
+      api::ble_v2::BlePeripheral& peripheral,
+      api::ble_v2::PowerMode power_mode) override ABSL_LOCKS_EXCLUDED(mutex_);
   std::unique_ptr<api::ble_v2::BleSocket> EstablishBleSocket(
       api::ble_v2::BlePeripheral* peripheral,
       const api::ble_v2::BleSocketLifeCycleCallback& callback) override
@@ -75,6 +72,7 @@ class BleV2Medium : public api::ble_v2::BleMedium {
   BluetoothAdapter& GetAdapter() { return *adapter_; }
 
  private:
+  // A concrete implemenation for GattServer.
   class GattServer : public api::ble_v2::GattServer {
    public:
     absl::optional<api::ble_v2::GattCharacteristic> CreateCharacteristic(
@@ -82,28 +80,40 @@ class BleV2Medium : public api::ble_v2::BleMedium {
         const std::vector<api::ble_v2::GattCharacteristic::Permission>&
             permissions,
         const std::vector<api::ble_v2::GattCharacteristic::Property>&
-            properties) override {
-      api::ble_v2::GattCharacteristic characteristic = {
-          .uuid = std::string(characteristic_uuid),
-          .servie_uuid = std::string(service_uuid)};
-      return characteristic;
-    }
+            properties) override;
 
     bool UpdateCharacteristic(
         const api::ble_v2::GattCharacteristic& characteristic,
-        const location::nearby::ByteArray& value) override {
-      // No action for now.
-      return true;
-    }
+        const location::nearby::ByteArray& value) override;
 
-    void Stop() override {
-      // No action for now.
-    }
+    void Stop() override;
+  };
+
+  // A concrete implemenation for GattClient.
+  class GattClient : public api::ble_v2::GattClient {
+   public:
+    bool DiscoverService(const std::string& service_uuid) override;
+
+    absl::optional<api::ble_v2::GattCharacteristic> GetCharacteristic(
+        absl::string_view service_uuid,
+        absl::string_view characteristic_uuid) override;
+
+    absl::optional<ByteArray> ReadCharacteristic(
+        const api::ble_v2::GattCharacteristic& characteristic) override;
+
+    void Disconnect() override;
+
+   private:
+    absl::Mutex mutex_;
+
+    // A flag to indicate the gatt connection alive or not. If it is
+    // disconnected/*false*/, the instance needs to be created again to bring it
+    // alive.
+    bool is_gatt_connection_ ABSL_GUARDED_BY(mutex_) = true;
   };
 
   absl::Mutex mutex_;
   BluetoothAdapter* adapter_;  // Our device adapter; read-only.
-  ByteArray advertisement_byte_ ABSL_GUARDED_BY(mutex_);
 };
 
 }  // namespace g3

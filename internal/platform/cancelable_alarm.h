@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "internal/platform/cancelable.h"
 #include "internal/platform/mutex.h"
@@ -39,7 +40,11 @@ class CancelableAlarm {
   CancelableAlarm(absl::string_view name, std::function<void()>&& runnable,
                   absl::Duration delay, ScheduledExecutor* scheduled_executor)
       : name_(name),
-        cancelable_(scheduled_executor->Schedule(std::move(runnable), delay)) {}
+        scheduled_executor_(scheduled_executor),
+        delay_(delay),
+        runnable_(std::move(runnable)) {
+    Run();
+  }
   ~CancelableAlarm() = default;
   CancelableAlarm(CancelableAlarm&& other) { *this = std::move(other); }
   CancelableAlarm& operator=(CancelableAlarm&& other) {
@@ -50,6 +55,10 @@ class CancelableAlarm {
       cancelable_ = std::move(other.cancelable_);
     }
     return *this;
+  }
+
+  void Run() {
+    cancelable_ = scheduled_executor_->Schedule(std::move(runnable_), delay_);
   }
 
   bool Cancel() {
@@ -63,6 +72,9 @@ class CancelableAlarm {
   Mutex mutex_;
   std::string name_;
   Cancelable cancelable_;
+  ScheduledExecutor* scheduled_executor_;
+  absl::Duration delay_;
+  std::function<void()> runnable_;
 };
 
 }  // namespace nearby

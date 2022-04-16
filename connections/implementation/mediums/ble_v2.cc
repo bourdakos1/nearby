@@ -26,8 +26,9 @@
 #include "connections/implementation/mediums/ble_v2/bloom_filter.h"
 #include "connections/implementation/mediums/bluetooth_radio.h"
 #include "connections/implementation/mediums/utils.h"
-#include "connections/implementation/mediums/uuid.h"
+#include "connections/power_level.h"
 #include "internal/platform/byte_array.h"
+#include "internal/platform/cancelable_alarm.h"
 #include "internal/platform/logging.h"
 #include "internal/platform/mutex_lock.h"
 
@@ -43,11 +44,25 @@ using ::location::nearby::api::ble_v2::PowerMode;
 
 constexpr int kMaxAdvertisementLength = 512;
 constexpr int kDummyServiceIdLength = 128;
+constexpr absl::Duration kPeripheralLostTimeout = absl::Seconds(3);
 
 }  // namespace
 
 BleV2::BleV2(BluetoothRadio& radio)
     : radio_(radio), adapter_(radio_.GetBluetoothAdapter()) {}
+
+BleV2::~BleV2() {
+  // Destructor is not taking locks, but methods it is calling are.
+  while (!scanned_service_ids_.empty()) {
+    StopScanning(scanned_service_ids_.begin()->data());
+  }
+  while (!advertising_service_ids_.empty()) {
+    StopAdvertising(advertising_service_ids_.begin()->data());
+  }
+
+  serial_executor_.Shutdown();
+  alarm_executor_.Shutdown();
+}
 
 bool BleV2::IsAvailable() const {
   MutexLock lock(&mutex_);
@@ -186,8 +201,10 @@ bool BleV2::StartAdvertising(
     NEARBY_LOGS(ERROR)
         << "Failed to turn on BLE advertising with advertisement bytes="
         << absl::BytesToHexString(advertisement_bytes.data())
+        << ", is_fast_advertisement=" << is_fast_advertisement
         << ", fast advertisement service uuid="
-        << fast_advertisement_service_uuid;
+        << (is_fast_advertisement ? fast_advertisement_service_uuid
+                                  : "[empty]");
 
     // If BLE advertising was not successful, stop the advertisement GATT
     // server.
@@ -278,7 +295,9 @@ bool BleV2::StartScanning(const std::string& service_id, PowerLevel power_level,
     return false;
   }
 
-  // TODO(edwinwu): Start discovered peripheral tracking.
+  // Start to track the advertisement found for specific `service_id`.
+  discovered_peripheral_tracker_.StartTracking(service_id, std::move(callback),
+                                               fast_advertisement_service_uuid);
 
   // Check if scan has been activated, if yes, no need to notify client
   // to scan again.
@@ -292,24 +311,45 @@ bool BleV2::StartScanning(const std::string& service_id, PowerLevel power_level,
   scanned_service_ids_.insert(service_id);
   // TODO(b/213835576): We should re-start scanning once the power level is
   // changed.
-  std::vector<std::string> service_uuids{
-      std::string(mediums::bleutils::kCopresenceServiceUuid)};
+  std::vector<std::string> scanning_service_uuids;
+  if (!fast_advertisement_service_uuid.empty()) {
+    scanning_service_uuids.push_back(fast_advertisement_service_uuid);
+  } else {
+    scanning_service_uuids.push_back(
+        std::string(mediums::bleutils::kCopresenceServiceUuid));
+  }
   if (!medium_.StartScanning(
-          service_uuids, PowerLevelToPowerMode(power_level),
+          scanning_service_uuids, PowerLevelToPowerMode(power_level),
           {
               .advertisement_found_cb =
-                  [](BleV2Peripheral peripheral,
-                     const BleAdvertisementData& advertisement_data) {
-                    // TODO(b/213835576): Move (or Copy at fallback) the
-                    // BleV2Peripheral.
-                    // TODO(b/216629800): Track the found advertisement.
+                  [this](BleV2Peripheral peripheral,
+                         const BleAdvertisementData& advertisement_data) {
+                    RunOnBleThread([this, peripheral = std::move(peripheral),
+                                    &advertisement_data]() {
+                      MutexLock lock(&mutex_);
+                      discovered_peripheral_tracker_
+                          .ProcessFoundBleAdvertisement(
+                              std::move(peripheral), advertisement_data,
+                              GetAdvertisementFetcher());
+                    });
                   },
           })) {
-    NEARBY_LOGS(INFO) << "Failed to start client scan of BLE services.";
+    NEARBY_LOGS(INFO) << "Failed to start scan of BLE services.";
+    discovered_peripheral_tracker_.StopTracking(service_id);
     // Erase the service id that is just added.
     scanned_service_ids_.erase(service_id);
     return false;
   }
+
+  // Set up lost alarm.
+  lost_alarm_ = std::make_unique<CancelableAlarm>(
+      "BLE.StartScanning() onLost",
+      [this]() {
+        MutexLock lock(&mutex_);
+        discovered_peripheral_tracker_.ProcessLostGattAdvertisements();
+        lost_alarm_->Run();
+      },
+      kPeripheralLostTimeout, &alarm_executor_);
 
   NEARBY_LOGS(INFO) << "Turned on BLE scanning with service id=" << service_id;
   return true;
@@ -324,8 +364,7 @@ bool BleV2::StopScanning(const std::string& service_id) {
     return false;
   }
 
-  // TODO(b/213835576): Cancel lost alarm and Stop tracking.
-
+  discovered_peripheral_tracker_.StopTracking(service_id);
   scanned_service_ids_.erase(service_id);
   NEARBY_LOGS(INFO) << "Turned off BLE scanning with service id=" << service_id;
 
@@ -334,7 +373,11 @@ bool BleV2::StopScanning(const std::string& service_id) {
     return true;
   }
 
+  // If no more scanning activities, then stop client scanning.
   NEARBY_LOGS(INFO) << "Turned off BLE client scanning";
+  if (lost_alarm_->IsValid()) {
+    lost_alarm_->Cancel();
+  }
   return medium_.StopScanning();
 }
 
@@ -366,18 +409,7 @@ bool BleV2::StartAdvertisementGattServerLocked(
     return false;
   }
 
-  std::unique_ptr<GattServer> gatt_server = medium_.StartGattServer({
-      .characteristic_subscription_cb =
-          [](const ServerGattConnection& connection,
-             const GattCharacteristic& characteristic) {
-            // TODO(b/213835576): Impl or remove.
-          },
-      .characteristic_unsubscription_cb =
-          [](const ServerGattConnection& connection,
-             const GattCharacteristic& characteristic) {
-            // TODO(b/213835576): Impl or remove.
-          },
-  });
+  std::unique_ptr<GattServer> gatt_server = medium_.StartGattServer();
   if (!gatt_server || !gatt_server->IsValid()) {
     NEARBY_LOGS(INFO) << "Unable to start an advertisement GATT server.";
     return false;
@@ -422,6 +454,107 @@ bool BleV2::GenerateAdvertisementCharacteristic(
   hosted_gatt_characteristics_.insert(gatt_characteristic.value());
 
   return true;
+}
+
+std::unique_ptr<mediums::AdvertisementReadResult>
+BleV2::ProcessFetchGattAdvertisementsRequest(
+    BleV2Peripheral peripheral, int num_slots, int psm,
+    const std::vector<std::string>& interesting_service_ids,
+    std::unique_ptr<mediums::AdvertisementReadResult>
+        advertisement_read_result) {
+  MutexLock lock(&mutex_);
+
+  if (!advertisement_read_result) {
+    advertisement_read_result =
+        std::make_unique<mediums::AdvertisementReadResult>();
+  }
+
+  if (!peripheral.IsValid()) {
+    NEARBY_LOGS(INFO) << "Can't read from an advertisement GATT server because "
+                         "ble peripheral is null.";
+    return advertisement_read_result;
+  }
+
+  if (!radio_.IsEnabled()) {
+    NEARBY_LOGS(INFO) << "Can't read from an advertisement GATT server because "
+                         "Bluetooth was never turned on.";
+    return advertisement_read_result;
+  }
+
+  if (!IsAvailableLocked()) {
+    NEARBY_LOGS(INFO) << "Can't read from an advertisement GATT server because "
+                         "BLE is not available.";
+    return advertisement_read_result;
+  }
+
+  return InternalReadAdvertisementFromGattServerLocked(
+      std::move(peripheral), num_slots, psm, interesting_service_ids,
+      std::move(advertisement_read_result));
+}
+
+std::unique_ptr<mediums::AdvertisementReadResult>
+BleV2::InternalReadAdvertisementFromGattServerLocked(
+    BleV2Peripheral peripheral, int num_slots, int psm,
+    const std::vector<std::string>& interesting_service_ids,
+    std::unique_ptr<mediums::AdvertisementReadResult>
+        advertisement_read_result) {
+  // Connect to a GATT server, reads advertisement data, and then disconnect
+  // from the GATT server.
+  bool read_success = true;
+  std::unique_ptr<GattClient> gatt_client = medium_.ConnectToGattServer(
+      std::move(peripheral), PowerLevelToPowerMode(PowerLevel::kHighPower));
+  if (!gatt_client || !gatt_client->IsValid()) {
+    advertisement_read_result->RecordLastReadStatus(false);
+    return advertisement_read_result;
+  }
+
+  // Always use kCopresenceServiceUuid for service uuid.
+  std::string service_uuid =
+      std::string(mediums::bleutils::kCopresenceServiceUuid);
+  if (!gatt_client->DiscoverService(service_uuid)) {
+    NEARBY_LOGS(WARNING) << "GATT client can't discover service.";
+    advertisement_read_result->RecordLastReadStatus(false);
+    return advertisement_read_result;
+  }
+
+  // Read all advertisements from all slots that we haven't read from yet.
+  for (int slot = 0; slot < num_slots; ++slot) {
+    // Make sure we haven't already read this advertisement before.
+    if (advertisement_read_result->HasAdvertisement(slot)) {
+      continue;
+    }
+
+    // Make sure the characteristic even exists for this slot number. If
+    // the characteristic doesn't exist, we shouldn't count the fetch as a
+    // failure because there's nothing we could've done about a
+    // non-existed characteristic.
+    auto gatt_characteristic = gatt_client->GetCharacteristic(
+        std::string(mediums::bleutils::kCopresenceServiceUuid),
+        mediums::bleutils::GenerateAdvertisementUuid(slot));
+    if (!gatt_characteristic.has_value()) {
+      continue;
+    }
+
+    // Read advertisement data from the characteristic associated with this
+    // slot.
+    auto characteristic_byte =
+        gatt_client->ReadCharacteristic(gatt_characteristic.value());
+    if (characteristic_byte.has_value()) {
+      advertisement_read_result->AddAdvertisement(slot, *characteristic_byte);
+      NEARBY_LOGS(VERBOSE) << "Successfully read advertisement at slot="
+                           << slot;
+    } else {
+      NEARBY_LOGS(WARNING) << "Can't read advertisement for slot=" << slot;
+      read_success = false;
+    }
+    // Whether or not we succeeded with this slot, we should try reading the
+    // other slots to get as many advertisements as possible before
+    // returning a success or failure.
+  }
+  gatt_client->Disconnect();
+
+  advertisement_read_result->RecordLastReadStatus(read_success);
+  return advertisement_read_result;
 }
 
 bool BleV2::StopAdvertisementGattServerLocked() {
@@ -480,6 +613,26 @@ PowerMode BleV2::PowerLevelToPowerMode(PowerLevel power_level) {
     default:
       return PowerMode::kUnknown;
   }
+}
+
+void BleV2::RunOnBleThread(Runnable runnable) {
+  serial_executor_.Execute(std::move(runnable));
+}
+
+mediums::DiscoveredPeripheralTracker::AdvertisementFetcher
+BleV2::GetAdvertisementFetcher() {
+  return {
+      .fetch_advertisements =
+          [this](BleV2Peripheral peripheral, int num_slots, int psm,
+                 const std::vector<std::string>& interesting_service_ids,
+                 std::unique_ptr<mediums::AdvertisementReadResult>
+                     advertisement_read_result)
+          -> std::unique_ptr<mediums::AdvertisementReadResult> {
+        return ProcessFetchGattAdvertisementsRequest(
+            std::move(peripheral), num_slots, psm, interesting_service_ids,
+            std::move(advertisement_read_result));
+      },
+  };
 }
 
 }  // namespace connections
