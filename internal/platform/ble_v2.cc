@@ -15,6 +15,8 @@
 #include "internal/platform/ble_v2.h"
 
 #include <memory>
+#include <string>
+#include <utility>
 
 #include "internal/platform/bluetooth_adapter.h"
 #include "internal/platform/implementation/ble_v2.h"
@@ -25,7 +27,6 @@ namespace location {
 namespace nearby {
 
 using ::location::nearby::api::ble_v2::BleAdvertisementData;
-using ::location::nearby::api::ble_v2::GattCharacteristic;
 using ::location::nearby::api::ble_v2::PowerMode;
 
 bool BleV2Medium::StartAdvertising(
@@ -91,34 +92,30 @@ bool BleV2Medium::StopScanning() {
   return impl_->StopScanning();
 }
 
-std::unique_ptr<GattServer> BleV2Medium::StartGattServer(
-    ServerGattConnectionCallback callback) {
-  {
-    MutexLock lock(&mutex_);
-    server_gatt_connection_callback_ = std::move(callback);
-  }
-
+std::unique_ptr<GattServer> BleV2Medium::StartGattServer() {
   std::unique_ptr<api::ble_v2::GattServer> api_gatt_server =
-      impl_->StartGattServer({
-          .characteristic_subscription_cb =
-              [this](api::ble_v2::ServerGattConnection& connection,
-                     const GattCharacteristic& characteristic) {
-                MutexLock lock(&mutex_);
-                ServerGattConnection server_gatt_connection(&connection);
-                server_gatt_connection_callback_.characteristic_subscription_cb(
-                    server_gatt_connection, characteristic);
-              },
-          .characteristic_unsubscription_cb =
-              [this](api::ble_v2::ServerGattConnection& connection,
-                     const GattCharacteristic& characteristic) {
-                MutexLock lock(&mutex_);
-                ServerGattConnection server_gatt_connection(&connection);
-                server_gatt_connection_callback_
-                    .characteristic_unsubscription_cb(server_gatt_connection,
-                                                      characteristic);
-              },
-      });
+      impl_->StartGattServer();
   return std::make_unique<GattServer>(std::move(api_gatt_server));
+}
+
+std::unique_ptr<GattClient> BleV2Medium::ConnectToGattServer(
+    BleV2Peripheral peripheral, PowerMode power_mode) {
+  std::unique_ptr<api::ble_v2::GattClient> api_gatt_client =
+      impl_->ConnectToGattServer(peripheral.GetImpl(), power_mode);
+  return std::make_unique<GattClient>(std::move(api_gatt_client));
+}
+
+BleV2ServerSocket BleV2Medium::OpenServerSocket(const std::string& service_id) {
+  return BleV2ServerSocket(impl_->OpenServerSocket(service_id));
+}
+
+BleV2Socket BleV2Medium::Connect(const std::string& service_id,
+                                 PowerMode power_mode,
+                                 const BleV2Peripheral& peripheral,
+                                 CancellationFlag* cancellation_flag) {
+  return BleV2Socket(impl_->Connect(service_id, power_mode,
+                                    /*mutated=*/peripheral.GetImpl(),
+                                    cancellation_flag));
 }
 
 }  // namespace nearby

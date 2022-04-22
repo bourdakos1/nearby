@@ -41,7 +41,9 @@ void BlePeripheral::SetAdvertisementBytes(
 BleV2Peripheral::BleV2Peripheral(BluetoothAdapter* adapter)
     : adapter_(*adapter) {}
 
-std::string BleV2Peripheral::GetId() const { return adapter_.GetMacAddress(); }
+std::string BleV2Peripheral::GetAddress() const {
+  return adapter_.GetMacAddress();
+}
 
 BluetoothDevice::BluetoothDevice(BluetoothAdapter* adapter)
     : adapter_(*adapter) {}
@@ -74,6 +76,10 @@ void BluetoothAdapter::SetBluetoothClassicMedium(
 
 void BluetoothAdapter::SetBleMedium(api::BleMedium* medium) {
   ble_medium_ = medium;
+}
+
+void BluetoothAdapter::SetBleV2Medium(api::ble_v2::BleMedium* medium) {
+  ble_v2_medium_ = medium;
 }
 
 bool BluetoothAdapter::SetStatus(Status status) {
