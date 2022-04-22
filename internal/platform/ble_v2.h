@@ -15,7 +15,11 @@
 #ifndef PLATFORM_PUBLIC_BLE_V2_H_
 #define PLATFORM_PUBLIC_BLE_V2_H_
 
+#include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "internal/platform/bluetooth_adapter.h"
@@ -24,45 +28,121 @@
 #include "internal/platform/implementation/ble_v2.h"
 #include "internal/platform/implementation/platform.h"
 #include "internal/platform/input_stream.h"
+#include "internal/platform/logging.h"
 #include "internal/platform/mutex.h"
 #include "internal/platform/output_stream.h"
 
 namespace location {
 namespace nearby {
 
-// Opaque wrapper over a ServerGattConnection.
-class ServerGattConnection final {
+class BleV2Socket final {
  public:
-  ServerGattConnection() = default;
-  explicit ServerGattConnection(
-      api::ble_v2::ServerGattConnection* server_gatt_connection)
-      : impl_(server_gatt_connection) {}
+  BleV2Socket() = default;
+  explicit BleV2Socket(std::unique_ptr<api::ble_v2::BleSocket> socket)
+      : impl_(std::move(socket)) {}
+  BleV2Socket(const BleV2Socket&) = default;
+  BleV2Socket& operator=(const BleV2Socket&) = default;
 
-  bool SendCharacteristic(const api::ble_v2::GattCharacteristic& characteristic,
-                          const ByteArray& value) {
-    return impl_->SendCharacteristic(characteristic, value);
+  // Returns the InputStream of the BleSocket.
+  // On error, returned stream will report Exception::kIo on any operation.
+  //
+  // The returned object is not owned by the caller, and can be invalidated once
+  // the BleSocket object is destroyed.
+  InputStream& GetInputStream() { return impl_->GetInputStream(); }
+
+  // Returns the OutputStream of the BleSocket.
+  // On error, returned stream will report Exception::kIo on any operation.
+  //
+  // The returned object is not owned by the caller, and can be invalidated once
+  // the BleSocket object is destroyed.
+  OutputStream& GetOutputStream() { return impl_->GetOutputStream(); }
+
+  // Sets the close notifier by cient side.
+  void SetCloseNotifier(std::function<void()> notifier) {
+    close_notifier_ = std::move(notifier);
   }
 
-  api::ble_v2::ServerGattConnection* GetImpl() { return impl_; }
+  // Returns Exception::kIo on error, Exception::kSuccess otherwise.
+  Exception Close() {
+    if (close_notifier_) {
+      auto notifier = std::move(close_notifier_);
+      notifier();
+    }
+    return impl_->Close();
+  }
 
+  // Returns true if a socket is usable. If this method returns false,
+  // it is not safe to call any other method.
+  // NOTE(socket validity):
+  // Socket created by a default public constructor is not valid, because
+  // it is missing platform implementation.
+  // The only way to obtain a valid socket is through connection, such as
+  // an object returned by BleMedium::Connect
+  // These methods may also return an invalid socket if connection failed for
+  // any reason.
   bool IsValid() const { return impl_ != nullptr; }
 
+  // Returns reference to platform implementation.
+  // This is used to communicate with platform code, and for debugging purposes.
+  // Returned reference will remain valid for while BleSocket object is
+  // itself valid. Typically BleSocket lifetime matches duration of the
+  // connection, and is controlled by end user, since they hold the instance.
+  api::ble_v2::BleSocket& GetImpl() { return *impl_; }
+
  private:
-  api::ble_v2::ServerGattConnection* impl_ = nullptr;
+  std::function<void()> close_notifier_;
+  std::shared_ptr<api::ble_v2::BleSocket> impl_;
+};
+
+class BleV2ServerSocket final {
+ public:
+  explicit BleV2ServerSocket(
+      std::unique_ptr<api::ble_v2::BleServerSocket> socket)
+      : impl_(std::move(socket)) {}
+  BleV2ServerSocket(const BleV2ServerSocket&) = default;
+  BleV2ServerSocket& operator=(const BleV2ServerSocket&) = default;
+
+  // Blocks until either:
+  // - at least one incoming connection request is available, or
+  // - ServerSocket is closed.
+  // On success, returns connected socket, ready to exchange data.
+  // On error, "impl_" will be nullptr and the caller will check it by calling
+  // member function "IsValid()"
+  // Once error is reported, it is permanent, and
+  // ServerSocket has to be closed by caller.
+  BleV2Socket Accept() {
+    std::unique_ptr<api::ble_v2::BleSocket> socket = impl_->Accept();
+    if (!socket) {
+      NEARBY_LOGS(INFO) << "BleServerSocket Accept() failed on server socket: "
+                        << this;
+    }
+    return BleV2Socket(std::move(socket));
+  }
+
+  // Returns Exception::kIo on error, Exception::kSuccess otherwise.
+  Exception Close() {
+    NEARBY_LOGS(INFO) << "BleServerSocket Closing:: " << this;
+    return impl_->Close();
+  }
+
+  bool IsValid() const { return impl_ != nullptr; }
+  api::ble_v2::BleServerSocket& GetImpl() { return *impl_; }
+
+ private:
+  std::shared_ptr<api::ble_v2::BleServerSocket> impl_;
 };
 
 // Opaque wrapper over a GattServer.
 // Move only, disallow copy.
 class GattServer final {
  public:
-  GattServer() = default;
   explicit GattServer(std::unique_ptr<api::ble_v2::GattServer> gatt_server)
       : impl_(std::move(gatt_server)) {}
   GattServer(GattServer&&) = default;
   GattServer& operator=(GattServer&&) = default;
   ~GattServer() { Stop(); }
 
-  absl::optional<api::ble_v2::GattCharacteristic> CreateCharacteristic(
+  std::optional<api::ble_v2::GattCharacteristic> CreateCharacteristic(
       const std::string& service_uuid, const std::string& characteristic_uuid,
       const std::vector<api::ble_v2::GattCharacteristic::Permission>&
           permissions,
@@ -92,6 +172,43 @@ class GattServer final {
   std::unique_ptr<api::ble_v2::GattServer> impl_;
 };
 
+class GattClient final {
+ public:
+  explicit GattClient(
+      std::unique_ptr<api::ble_v2::GattClient> client_gatt_connection)
+      : impl_(std::move(client_gatt_connection)) {}
+  GattClient(const GattClient&) = default;
+  GattClient& operator=(const GattClient&) = default;
+
+  bool DiscoverService(const std::string& service_uuid) {
+    return impl_->DiscoverService(service_uuid);
+  }
+
+  // TODO(edwinwu): Change std::string to Uuid.
+  std::optional<api::ble_v2::GattCharacteristic> GetCharacteristic(
+      const std::string& service_uuid, const std::string& characteristic_uuid) {
+    return impl_->GetCharacteristic(service_uuid, characteristic_uuid);
+  }
+
+  std::optional<ByteArray> ReadCharacteristic(
+      api::ble_v2::GattCharacteristic& characteristic) {
+    return impl_->ReadCharacteristic(characteristic);
+  }
+
+  void Disconnect() { impl_->Disconnect(); }
+
+  // Returns true if a client_gatt_connection is usable. If this method returns
+  // false, it is not safe to call any other method.
+  bool IsValid() const { return impl_ != nullptr; }
+
+  // Returns reference to platform implementation.
+  // This is used to communicate with platform code, and for debugging purposes.
+  api::ble_v2::GattClient* GetImpl() { return impl_.get(); }
+
+ private:
+  std::unique_ptr<api::ble_v2::GattClient> impl_;
+};
+
 // Container of operations that can be performed over the BLE medium.
 class BleV2Medium final {
  public:
@@ -111,17 +228,6 @@ class BleV2Medium final {
             BleV2Peripheral, const api::ble_v2::BleAdvertisementData&>();
   };
 
-  struct ServerGattConnectionCallback {
-    std::function<void(ServerGattConnection& connection,
-                       const api::ble_v2::GattCharacteristic& characteristic)>
-        characteristic_subscription_cb = location::nearby::DefaultCallback<
-            ServerGattConnection&, const api::ble_v2::GattCharacteristic&>();
-    std::function<void(ServerGattConnection& connection,
-                       const api::ble_v2::GattCharacteristic& characteristic)>
-        characteristic_unsubscription_cb = location::nearby::DefaultCallback<
-            ServerGattConnection&, const api::ble_v2::GattCharacteristic&>();
-  };
-
   explicit BleV2Medium(BluetoothAdapter& adapter)
       : impl_(
             api::ImplementationPlatform::CreateBleV2Medium(adapter.GetImpl())),
@@ -139,8 +245,23 @@ class BleV2Medium final {
                      api::ble_v2::PowerMode power_mode, ScanCallback callback);
   bool StopScanning();
 
-  std::unique_ptr<GattServer> StartGattServer(
-      ServerGattConnectionCallback callback);
+  // Starts Gatt Server for waiting to client connection.
+  std::unique_ptr<GattServer> StartGattServer();
+
+  // Returns a new GattClient connection to a gatt server.
+  std::unique_ptr<GattClient> ConnectToGattServer(
+      BleV2Peripheral peripheral, api::ble_v2::PowerMode power_mode);
+
+  // Returns a new BleServerSocket.
+  // On Success, BleServerSocket::IsValid() returns true.
+  BleV2ServerSocket OpenServerSocket(const std::string& service_id);
+
+  // Returns a new BleLanSocket.
+  // On Success, BleLanSocket::IsValid() returns true.
+  BleV2Socket Connect(const std::string& service_id,
+                      api::ble_v2::PowerMode power_mode,
+                      const BleV2Peripheral& peripheral,
+                      CancellationFlag* cancellation_flag);
 
   bool IsValid() const { return impl_ != nullptr; }
 
@@ -150,8 +271,6 @@ class BleV2Medium final {
   Mutex mutex_;
   std::unique_ptr<api::ble_v2::BleMedium> impl_;
   BluetoothAdapter& adapter_;
-  ServerGattConnectionCallback server_gatt_connection_callback_
-      ABSL_GUARDED_BY(mutex_);
   absl::flat_hash_set<api::ble_v2::BlePeripheral*> peripherals_
       ABSL_GUARDED_BY(mutex_);
   ScanCallback scan_callback_ ABSL_GUARDED_BY(mutex_);

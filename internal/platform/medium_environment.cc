@@ -533,15 +533,18 @@ void MediumEnvironment::UpdateBleV2MediumForAdvertising(
                           << ", enabled=" << enabled;
         for (auto& medium_info : ble_v2_mediums_) {
           const api::ble_v2::BleMedium* remote_medium = medium_info.first;
-          const BleV2MediumContext& remote_context = medium_info.second;
+          BleV2MediumContext& remote_context = medium_info.second;
           // Do not send notification to the same medium.
           if (remote_medium == &medium) continue;
+          if (!context.advertisement_data.service_uuids.contains(
+                  remote_context.scanning_service_uuid))
+            continue;
           NEARBY_LOGS(INFO)
               << "G3 UpdateBleV2MediumForAdvertising, found other medium="
               << remote_medium << ", remote_medium_context=" << &remote_context
               << ", remote_context.peripheral=" << remote_context.ble_peripheral
               << ". Ready to call OnBleV2PeripheralStateChanged.";
-          OnBleV2PeripheralStateChanged(enabled, context,
+          OnBleV2PeripheralStateChanged(enabled, remote_context,
                                         context.advertisement_data,
                                         *context.ble_peripheral);
         }
@@ -549,10 +552,12 @@ void MediumEnvironment::UpdateBleV2MediumForAdvertising(
 }
 
 void MediumEnvironment::UpdateBleV2MediumForScanning(
-    bool enabled, BleScanCallback callback, api::ble_v2::BleMedium& medium) {
+    bool enabled, const std::string& scanning_service_uuid,
+    BleScanCallback callback, api::ble_v2::BleMedium& medium) {
   if (!enabled_) return;
   RunOnMediumEnvironmentThread(
-      [this, &medium, callback = std::move(callback), enabled]() {
+      [this, &medium, scanning_service_uuid = scanning_service_uuid,
+       callback = std::move(callback), enabled]() {
         auto it = ble_v2_mediums_.find(&medium);
         if (it == ble_v2_mediums_.end()) {
           NEARBY_LOGS(INFO)
@@ -562,6 +567,7 @@ void MediumEnvironment::UpdateBleV2MediumForScanning(
         }
         BleV2MediumContext& context = it->second;
         context.scan_callback = std::move(callback);
+        context.scanning_service_uuid = scanning_service_uuid;
         NEARBY_LOGS(INFO) << "G3 UpdateBleV2MediumForScanning: this=" << this
                           << ", medium=" << &medium
                           << ", medium_context=" << &context
@@ -574,10 +580,14 @@ void MediumEnvironment::UpdateBleV2MediumForScanning(
             // medium.
             if (remote_medium == &medium || !remote_context.advertising)
               continue;
+            if (!remote_context.advertisement_data.service_uuids.contains(
+                    context.scanning_service_uuid))
+              continue;
             NEARBY_LOGS(INFO)
                 << "G3 UpdateBleV2MediumForScanning, found other medium="
                 << remote_medium
                 << ", remote_medium_context=" << &remote_context
+                << ", scanning_service_uuid=" << scanning_service_uuid
                 << ". Ready to call OnBleV2PeripheralStateChanged.";
             OnBleV2PeripheralStateChanged(enabled, context,
                                           remote_context.advertisement_data,
@@ -585,6 +595,71 @@ void MediumEnvironment::UpdateBleV2MediumForScanning(
           }
         }
       });
+}
+
+void MediumEnvironment::InsertBleV2MediumGattCharacteristics(
+    const api::ble_v2::GattCharacteristic& characteristic,
+    const ByteArray& gatt_advertisement_byte) {
+  if (!enabled_) return;
+  CountDownLatch latch(1);
+  RunOnMediumEnvironmentThread(
+      [this, &latch, &characteristic, &gatt_advertisement_byte]() {
+        gatt_advertisement_bytes_.insert_or_assign(characteristic,
+                                                   gatt_advertisement_byte);
+        latch.CountDown();
+      });
+  latch.Await();
+}
+
+bool MediumEnvironment::ContainsBleV2MediumGattCharacteristics(
+    absl::string_view service_uuid, absl::string_view characteristic_uuid) {
+  if (!enabled_) return false;
+  bool found_characteristic = false;
+  CountDownLatch latch(1);
+  RunOnMediumEnvironmentThread([this, &latch, &service_uuid,
+                                &characteristic_uuid, &found_characteristic]() {
+    for (const auto& item : gatt_advertisement_bytes_) {
+      if (service_uuid == item.first.servie_uuid) {
+        if (characteristic_uuid.empty()) {
+          // Found the service uuid and no need to search characteristic
+          // uuid.
+          found_characteristic = true;
+          break;
+        }
+        if (characteristic_uuid == item.first.uuid) {
+          found_characteristic = true;
+          break;
+        }
+      }
+    }
+    latch.CountDown();
+  });
+  latch.Await();
+  return found_characteristic;
+}
+
+ByteArray MediumEnvironment::ReadBleV2MediumGattCharacteristics(
+    const api::ble_v2::GattCharacteristic& characteristic) {
+  if (!enabled_) return {};
+  ByteArray gatt_advertisement_byte = {};
+  CountDownLatch latch(1);
+  RunOnMediumEnvironmentThread(
+      [this, &latch, &characteristic, &gatt_advertisement_byte]() {
+        for (const auto& item : gatt_advertisement_bytes_) {
+          if (item.first == characteristic) {
+            gatt_advertisement_byte = item.second;
+            break;
+          }
+        }
+        latch.CountDown();
+      });
+  latch.Await();
+  return gatt_advertisement_byte;
+}
+
+void MediumEnvironment::ClearBleV2MediumGattCharacteristics() {
+  if (!enabled_) return;
+  RunOnMediumEnvironmentThread([this]() { gatt_advertisement_bytes_.clear(); });
 }
 
 void MediumEnvironment::UnregisterBleV2Medium(api::ble_v2::BleMedium& medium) {
