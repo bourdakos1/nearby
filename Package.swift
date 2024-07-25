@@ -32,6 +32,26 @@ let package = Package(
       targets: ["NearbyConnections"]
     ),
     .library(
+      name: "JSON",
+      targets: ["json"]
+    ),
+    .library(
+      name: "UKey2",
+      targets: ["ukey2"]
+    ),
+    .library(
+      name: "SMHasher",
+      targets: ["smhasher"]
+    ),
+    .library(
+      name: "Protobuf",
+      targets: ["protobuf"]
+    ),
+    .library(
+      name: "GoogleToolboxForMac",
+      targets: ["google-toolbox-for-mac"]
+    ),
+    .library(
       name: "NearbyConnectionsDynamic",
       type: .dynamic,
       targets: ["NearbyConnections"]
